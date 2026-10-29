@@ -215,6 +215,80 @@ test("shares a workspace with an existing account without exposing other workspa
   assert.equal(addMember.status, 201);
   assert.equal((await addMember.json()).memberCount, 2);
 
+  const invitedEmail = `workspace-invite-${Date.now()}@example.com`;
+  const invitationResponse = await fetch(`${baseUrl}/api/workspaces/${sharedWorkspace.id}/invitations`, {
+    method: "POST",
+    headers: {
+      ...headers,
+      Cookie: ownerCookie,
+      "X-Workspace-Id": String(sharedWorkspace.id),
+    },
+    body: JSON.stringify({ email: invitedEmail }),
+  });
+  assert.equal(invitationResponse.status, 201);
+  const invitation = await invitationResponse.json();
+  const firstToken = new URL(invitation.invitationUrl, "http://localhost").searchParams.get("invite");
+  assert(firstToken);
+
+  const renewedInvitationResponse = await fetch(`${baseUrl}/api/workspaces/${sharedWorkspace.id}/invitations`, {
+    method: "POST",
+    headers: {
+      ...headers,
+      Cookie: ownerCookie,
+      "X-Workspace-Id": String(sharedWorkspace.id),
+    },
+    body: JSON.stringify({ email: invitedEmail }),
+  });
+  assert.equal(renewedInvitationResponse.status, 201);
+  const renewedInvitation = await renewedInvitationResponse.json();
+  const token = new URL(renewedInvitation.invitationUrl, "http://localhost").searchParams.get("invite");
+  assert(token);
+  assert.notEqual(token, firstToken);
+  assert.equal(
+    (await fetch(`${baseUrl}/api/workspace-invitations/${firstToken}`)).status,
+    410,
+  );
+
+  const invitationDetailsResponse = await fetch(`${baseUrl}/api/workspace-invitations/${token}`);
+  assert.equal(invitationDetailsResponse.status, 200);
+  assert.deepEqual((await invitationDetailsResponse.json()).invitation, {
+    email: invitedEmail,
+    workspaceName: sharedWorkspace.name,
+    expiresAt: renewedInvitation.expiresAt,
+  });
+
+  const wrongInviteEmail = await fetch(`${baseUrl}/api/auth/register-invitation`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      email: `wrong-${invitedEmail}`,
+      password: "correct-horse-battery",
+      token,
+    }),
+  });
+  assert.equal(wrongInviteEmail.status, 400);
+
+  const invitedRegistration = await fetch(`${baseUrl}/api/auth/register-invitation`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      email: invitedEmail,
+      password: "correct-horse-battery",
+      token,
+    }),
+  });
+  assert.equal(invitedRegistration.status, 201);
+  const invitedUser = await invitedRegistration.json();
+  assert.equal(invitedUser.workspaceId, sharedWorkspace.id);
+  const invitedCookie = invitedRegistration.headers.get("set-cookie").split(";")[0];
+  const acceptedInvitation = await fetch(`${baseUrl}/api/workspace-invitations/${token}`);
+  assert.equal(acceptedInvitation.status, 410);
+
+  const invitedWorkspaceLoans = await fetch(`${baseUrl}/api/loans`, {
+    headers: { Cookie: invitedCookie, "X-Workspace-Id": String(sharedWorkspace.id) },
+  });
+  assert.equal(invitedWorkspaceLoans.status, 200);
+
   const memberWorkspaces = await fetch(`${baseUrl}/api/workspaces`, {
     headers: { Cookie: memberCookie },
   });
@@ -349,4 +423,78 @@ test("shares a workspace with an existing account without exposing other workspa
     headers: { Cookie: ownerCookie, "X-Workspace-Id": String(emptyWorkspace.id) },
   });
   assert.equal(removedWorkspaceAccess.status, 403);
+});
+
+test("reports workspace payment history by user and across all users", async () => {
+  const headers = { "Content-Type": "application/json" };
+  const accounts = await Promise.all(["owner", "member", "outsider"].map(async (role) => {
+    const email = `payment-report-${role}-${Date.now()}@example.com`;
+    const response = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ email, password: "correct-horse-battery" }),
+    });
+    assert.equal(response.status, 201);
+    return { email, cookie: response.headers.get("set-cookie").split(";")[0] };
+  }));
+  const [owner, member, outsider] = accounts;
+  const workspaceResponse = await fetch(`${baseUrl}/api/workspaces`, {
+    method: "POST",
+    headers: { ...headers, Cookie: owner.cookie },
+    body: JSON.stringify({ name: "Payment history ledger" }),
+  });
+  const workspace = (await workspaceResponse.json()).workspace;
+  const workspaceHeaders = { "X-Workspace-Id": String(workspace.id) };
+
+  const addMember = await fetch(`${baseUrl}/api/workspaces/${workspace.id}/members`, {
+    method: "POST",
+    headers: { ...headers, Cookie: owner.cookie, ...workspaceHeaders },
+    body: JSON.stringify({ email: member.email }),
+  });
+  assert.equal(addMember.status, 201);
+
+  const loanResponse = await fetch(`${baseUrl}/api/loans`, {
+    method: "POST",
+    headers: { ...headers, Cookie: owner.cookie, ...workspaceHeaders },
+    body: JSON.stringify({
+      direction: "lent",
+      counterparty: "Jordan Lee",
+      amount: 100,
+      loanDate: "2026-10-01",
+    }),
+  });
+  const loan = (await loanResponse.json()).loan;
+
+  for (const [account, amount, paymentDate] of [
+    [owner, 20, "2026-10-12"],
+    [member, 15, "2026-10-13"],
+  ]) {
+    const response = await fetch(`${baseUrl}/api/loans/${loan.id}/payments`, {
+      method: "POST",
+      headers: { ...headers, Cookie: account.cookie, ...workspaceHeaders },
+      body: JSON.stringify({ amount, paymentDate }),
+    });
+    assert.equal(response.status, 201);
+  }
+
+  const reportResponse = await fetch(`${baseUrl}/api/reports/payments`, {
+    headers: { Cookie: owner.cookie, ...workspaceHeaders },
+  });
+  assert.equal(reportResponse.status, 200);
+  const report = await reportResponse.json();
+  assert.deepEqual(report.members.map(({ email }) => email), [member.email, owner.email].sort());
+  assert.deepEqual(report.payments.map(({ amount, recordedBy }) => [amount, recordedBy.email]), [
+    [15, member.email],
+    [20, owner.email],
+  ]);
+
+  const memberReport = await fetch(`${baseUrl}/api/reports/payments`, {
+    headers: { Cookie: member.cookie, ...workspaceHeaders },
+  });
+  assert.deepEqual(await memberReport.json(), report);
+
+  const privateReport = await fetch(`${baseUrl}/api/reports/payments`, {
+    headers: { Cookie: outsider.cookie, ...workspaceHeaders },
+  });
+  assert.equal(privateReport.status, 403);
 });

@@ -4,15 +4,19 @@ A small sign-in app with a React interface, an Express API,
 SQLite persistence, scrypt password hashes, and HTTP-only cookie sessions.
 
 Signed-in users also get a private loan ledger with lent and borrowed loans,
-repayment tracking, a due-date calendar, and monthly activity reports. Amounts
-are displayed in Philippine pesos (PHP) and stored as integer centavos.
+repayment tracking, upcoming due dates, and monthly activity reports. Payment
+reports show the full workspace history and can be filtered by the member who
+recorded each payment. Amounts are displayed in Philippine pesos (PHP) and
+stored as integer centavos.
 Each account starts with a private workspace. Create additional workspaces,
 switch between them, and add existing accounts to share a workspace. Adding a
 member grants access immediately; the app does not send an email invitation.
-Members can add loans and payments in workspaces they belong to; separate
-workspaces remain isolated. Any member can remove an empty workspace for all
-members. Workspaces with loans, or workspaces that would leave a member without
-another workspace, cannot be removed.
+For someone without an account, create a one-time invitation link to copy and
+share. The recipient creates an account using the invited email address; links
+expire after seven days. Members can add loans and payments in workspaces they
+belong to; separate workspaces remain isolated. Any member can remove an empty
+workspace for all members. Workspaces with loans, or workspaces that would
+leave a member without another workspace, cannot be removed.
 
 ## Requirements
 
@@ -49,8 +53,17 @@ set `DATABASE_PATH` to store it elsewhere.
 - `GET /api/workspaces` — list workspaces for the signed-in account
 - `POST /api/workspaces` — create a workspace
 - `POST /api/workspaces/:id/members` — add an existing account by email
+- `POST /api/workspaces/:id/invitations` — create a seven-day invite link for
+  an email without an account
+- `GET /api/workspace-invitations/:token` — get details for a valid invite link
+- `POST /api/auth/register-invitation` — create an account and join the invited
+  workspace in one operation
+- `POST /api/workspace-invitations/:token/accept` — accept an invite while
+  signed in with the invited email
 - `DELETE /api/workspaces/:id` — remove an empty workspace for all members
 - `GET /api/loans` — list loans and payments for the selected workspace
+- `GET /api/reports/payments` — list workspace members and payment history with
+  the member who recorded each payment
 - `POST /api/loans` — add a loan with direction, counterparty, amount, loan date,
   optional due date, and optional notes
 - `POST /api/loans/:id/payments` — record a payment against an outstanding loan
@@ -61,5 +74,7 @@ Loan endpoints require a valid session and workspace membership. Send the
 selected workspace ID in the `X-Workspace-Id` header; the server rejects access
 to workspaces the account has not joined. Existing single-user loan records are
 migrated into their owner's personal workspace on startup.
+Payments recorded before user attribution was added remain visible in reports
+as unattributed historical payments.
 
 Run the API tests with `npm test`.

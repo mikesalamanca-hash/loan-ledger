@@ -13,7 +13,11 @@ async function request(path, options = {}) {
 
   if (response.status === 204) return null;
   const result = await response.json();
-  if (!response.ok) throw new Error(result.error || "Something went wrong.");
+  if (!response.ok) {
+    const error = new Error(result.error || "Something went wrong.");
+    error.status = response.status;
+    throw error;
+  }
   return result;
 }
 
@@ -25,10 +29,6 @@ const money = new Intl.NumberFormat("en-PH", {
 const shortDate = new Intl.DateTimeFormat("en-US", {
   month: "short",
   day: "numeric",
-  year: "numeric",
-});
-const monthFormat = new Intl.DateTimeFormat("en-US", {
-  month: "long",
   year: "numeric",
 });
 const today = () => {
@@ -60,7 +60,6 @@ function addDays(dateString, days) {
 function Icon({ name }) {
   const paths = {
     overview: <><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></>,
-    calendar: <><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M16 3v4M8 3v4M3 10h18" /></>,
     report: <><path d="M4 19V5M4 19h17" /><path d="m7 15 4-4 3 2 6-7" /></>,
     plus: <><path d="M12 5v14M5 12h14" /></>,
     arrow: <><path d="m9 18 6-6-6-6" /></>,
@@ -255,39 +254,6 @@ function WorkspaceDialog({ onClose, onSave, busy }) {
   );
 }
 
-function AddUserDialog({ workspace, onClose, onSave, busy }) {
-  const [email, setEmail] = useState("");
-  const [error, setError] = useState("");
-
-  async function submit(event) {
-    event.preventDefault();
-    setError("");
-    try {
-      await onSave(email);
-    } catch (reason) {
-      setError(reason.message);
-    }
-  }
-
-  return (
-    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section aria-labelledby="member-dialog-title" aria-modal="true" className="modal compact-modal" role="dialog">
-        <div className="modal-heading">
-          <div><p className="eyebrow">SHARE THIS LEDGER</p><h2 id="member-dialog-title">Add a user</h2></div>
-          <button aria-label="Close dialog" className="icon-button" onClick={onClose} type="button"><Icon name="close" /></button>
-        </div>
-        <p className="modal-intro">Add someone with an existing account to <strong>{workspace.name}</strong>. This immediately grants access to its loans and payments; no email is sent.</p>
-        <form className="dialog-form" onSubmit={submit}>
-          <label htmlFor="member-email">Account email</label>
-          <input autoComplete="email" autoFocus id="member-email" onChange={(event) => setEmail(event.target.value)} placeholder="person@example.com" required type="email" value={email} />
-          {error && <p className="error" role="alert">{error}</p>}
-          <button className="button modal-submit" disabled={busy} type="submit">{busy ? "Adding…" : "Add to workspace"}</button>
-        </form>
-      </section>
-    </div>
-  );
-}
-
 function RemoveWorkspaceDialog({ workspace, onClose, onRemove, busy }) {
   const [error, setError] = useState("");
 
@@ -320,28 +286,59 @@ function RemoveWorkspaceDialog({ workspace, onClose, onRemove, busy }) {
 }
 
 export default function App() {
+  const inviteToken = new URLSearchParams(window.location.search).get("invite");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [newAccountEmail, setNewAccountEmail] = useState("");
+  const [newAccountPassword, setNewAccountPassword] = useState("");
+  const [newAccountConfirm, setNewAccountConfirm] = useState("");
+  const [inviteMode, setInviteMode] = useState("register");
+  const [inviteDetails, setInviteDetails] = useState(null);
+  const [inviteError, setInviteError] = useState("");
   const [user, setUser] = useState(null);
   const [checkingSession, setCheckingSession] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [loans, setLoans] = useState([]);
+  const [paymentReport, setPaymentReport] = useState(null);
+  const [paymentReportLoading, setPaymentReportLoading] = useState(false);
+  const [paymentUserFilter, setPaymentUserFilter] = useState("all");
+  const [paymentReportRefresh, setPaymentReportRefresh] = useState(0);
   const [workspaces, setWorkspaces] = useState([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState(null);
   const [workspaceLoading, setWorkspaceLoading] = useState(true);
   const [activePage, setActivePage] = useState("Overview");
   const [showLoanDialog, setShowLoanDialog] = useState(false);
   const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false);
-  const [showAddUserDialog, setShowAddUserDialog] = useState(false);
   const [showRemoveWorkspaceDialog, setShowRemoveWorkspaceDialog] = useState(false);
   const [paymentLoan, setPaymentLoan] = useState(null);
   const [notice, setNotice] = useState("");
-  const [calendarMonth, setCalendarMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
 
   useEffect(() => {
+    if (inviteToken) {
+      request(`/api/workspace-invitations/${encodeURIComponent(inviteToken)}`)
+        .then((result) => {
+          setInviteDetails(result.invitation);
+          setEmail(result.invitation.email);
+        })
+        .catch((reason) => setInviteError(reason.message));
+    }
     request("/api/auth/me")
-      .then((result) => setUser(result.user))
+      .then(async (result) => {
+        if (inviteToken) {
+          try {
+            const accepted = await request(
+              `/api/workspace-invitations/${encodeURIComponent(inviteToken)}/accept`,
+              { method: "POST" },
+            );
+            localStorage.setItem(`ledger.workspace.${result.user.id}`, String(accepted.workspaceId));
+            setNotice(`You joined ${accepted.workspaceName}.`);
+          } catch (reason) {
+            setError(reason.message);
+          }
+        }
+        setUser(result.user);
+      })
       .catch((reason) => {
         if (reason.message !== "Not signed in.") setError(reason.message);
       })
@@ -379,6 +376,7 @@ export default function App() {
   useEffect(() => {
     if (!user || !selectedWorkspaceId) {
       setLoans([]);
+      setPaymentReport(null);
       return;
     }
     let active = true;
@@ -395,6 +393,34 @@ export default function App() {
       });
     return () => { active = false; };
   }, [user, selectedWorkspaceId]);
+
+  useEffect(() => {
+    setPaymentUserFilter("all");
+  }, [user, selectedWorkspaceId]);
+
+  useEffect(() => {
+    if (!user || !selectedWorkspaceId) {
+      setPaymentReport(null);
+      setPaymentReportLoading(false);
+      return;
+    }
+
+    let active = true;
+    setPaymentReport(null);
+    setPaymentReportLoading(true);
+    request("/api/reports/payments", { workspaceId: selectedWorkspaceId })
+      .then((result) => {
+        if (active) setPaymentReport(result);
+      })
+      .catch((reason) => {
+        if (active) setError(reason.message);
+      })
+      .finally(() => {
+        if (active) setPaymentReportLoading(false);
+      });
+
+    return () => { active = false; };
+  }, [user, selectedWorkspaceId, paymentReportRefresh]);
 
   const selectedWorkspace = workspaces.find((workspace) => workspace.id === selectedWorkspaceId);
 
@@ -418,12 +444,62 @@ export default function App() {
     setError("");
     setSubmitting(true);
     try {
-      const result = await request("/api/auth/login", {
+      const creatingFromInvite = Boolean(inviteToken && inviteMode === "register");
+      const result = await request(
+        creatingFromInvite ? "/api/auth/register-invitation" : "/api/auth/login",
+        {
         method: "POST",
-        body: JSON.stringify({ email, password }),
-      });
+        body: JSON.stringify(creatingFromInvite
+          ? { email, password, token: inviteToken }
+          : { email, password }),
+        },
+      );
+      if (creatingFromInvite) {
+        localStorage.setItem(`ledger.workspace.${result.user.id}`, String(result.workspaceId));
+      } else if (inviteToken) {
+        const accepted = await request(
+          `/api/workspace-invitations/${encodeURIComponent(inviteToken)}/accept`,
+          { method: "POST" },
+        );
+        localStorage.setItem(`ledger.workspace.${result.user.id}`, String(accepted.workspaceId));
+        setNotice(`You joined ${accepted.workspaceName}.`);
+      }
       setUser(result.user);
       setPassword("");
+    } catch (reason) {
+      setError(reason.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function createAccount(event) {
+    event.preventDefault();
+    setError("");
+    if (newAccountPassword !== newAccountConfirm) {
+      setError("Passwords do not match.");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const result = await request("/api/auth/register", {
+        method: "POST",
+        body: JSON.stringify({
+          email: newAccountEmail,
+          password: newAccountPassword,
+        }),
+      });
+      setUser(result.user);
+      setWorkspaces([]);
+      setSelectedWorkspaceId(null);
+      setLoans([]);
+      setWorkspaceLoading(true);
+      setActivePage("Overview");
+      setNewAccountEmail("");
+      setNewAccountPassword("");
+      setNewAccountConfirm("");
+      setNotice("Account created. You are now signed in to the new account.");
     } catch (reason) {
       setError(reason.message);
     } finally {
@@ -464,6 +540,7 @@ export default function App() {
     try {
       const result = await request(`/api/loans/${loanId}/payments`, { method: "POST", workspaceId: selectedWorkspaceId, body: JSON.stringify(payment) });
       setLoans((current) => current.map((loan) => loan.id === loanId ? result.loan : loan));
+      setPaymentReportRefresh((current) => current + 1);
       setPaymentLoan(null);
       setError("");
     } finally {
@@ -482,28 +559,6 @@ export default function App() {
       setLoans([]);
       setShowWorkspaceDialog(false);
       setNotice(`Created ${result.workspace.name}. Add existing accounts to share it.`);
-      setError("");
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  async function addWorkspaceMember(email) {
-    if (!selectedWorkspace) throw new Error("Choose a workspace first.");
-    setSubmitting(true);
-    try {
-      const result = await request(`/api/workspaces/${selectedWorkspace.id}/members`, {
-        method: "POST",
-        workspaceId: selectedWorkspace.id,
-        body: JSON.stringify({ email }),
-      });
-      setWorkspaces((current) => current.map((workspace) =>
-        workspace.id === selectedWorkspace.id
-          ? { ...workspace, memberCount: result.memberCount }
-          : workspace,
-      ));
-      setShowAddUserDialog(false);
-      setNotice(`${result.member.email} can now access ${selectedWorkspace.name}.`);
       setError("");
     } finally {
       setSubmitting(false);
@@ -541,6 +596,7 @@ export default function App() {
   function selectWorkspace(event) {
     const workspaceId = Number(event.target.value);
     setSelectedWorkspaceId(workspaceId);
+    setPaymentUserFilter("all");
     localStorage.setItem(`ledger.workspace.${user.id}`, String(workspaceId));
     setLoans([]);
     setWorkspaceLoading(true);
@@ -556,28 +612,55 @@ export default function App() {
       <main className="page">
         <section className="card auth-card" aria-labelledby="page-title">
           <div className="brand-mark" aria-hidden="true">L</div>
-          <p className="eyebrow">WELCOME BACK</p>
-          <h1 id="page-title">Sign in to your account</h1>
-          <p className="subtitle">Enter your details to continue.</p>
+          <p className="eyebrow">{inviteDetails ? "YOU’RE INVITED" : "WELCOME BACK"}</p>
+          <h1 id="page-title">
+            {inviteDetails && inviteMode === "register"
+              ? `Join ${inviteDetails.workspaceName}`
+              : "Sign in to your account"}
+          </h1>
+          <p className="subtitle">
+            {inviteDetails
+              ? inviteMode === "register"
+                ? `Create an account to join ${inviteDetails.workspaceName}.`
+                : `Sign in with ${inviteDetails.email} to accept the invitation.`
+              : "Enter your details to continue."}
+          </p>
+          {inviteToken && !inviteDetails && !inviteError && (
+            <p className="loading">Checking your invitation…</p>
+          )}
+          {inviteError && <p className="error" role="alert">{inviteError}</p>}
           <form onSubmit={handleSubmit}>
             <label htmlFor="email">Email address</label>
-            <input autoComplete="email" id="email" name="email" onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" required type="email" value={email} />
+            <input autoComplete="email" id="email" name="email" onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" readOnly={Boolean(inviteDetails)} required type="email" value={email} />
             <label htmlFor="password">Password</label>
-            <input autoComplete="current-password" id="password" maxLength={128} name="password" onChange={(event) => setPassword(event.target.value)} placeholder="Enter your password" required type="password" value={password} />
+            <input autoComplete={inviteDetails && inviteMode === "register" ? "new-password" : "current-password"} id="password" maxLength={128} minLength={inviteDetails && inviteMode === "register" ? 8 : undefined} name="password" onChange={(event) => setPassword(event.target.value)} placeholder={inviteDetails && inviteMode === "register" ? "At least 8 characters" : "Enter your password"} required type="password" value={password} />
             {error && <p className="error" role="alert">{error}</p>}
-            <button className="button" disabled={submitting} type="submit">{submitting ? "Please wait…" : "Sign in"}</button>
+            <button className="button" disabled={submitting || Boolean(inviteToken && (!inviteDetails || inviteError))} type="submit">
+              {submitting ? "Please wait…" : inviteDetails && inviteMode === "register" ? "Create account and join" : "Sign in"}
+            </button>
           </form>
+          {inviteDetails && (
+            <p className="switch-mode">
+              {inviteMode === "register" ? "Already have an account?" : "Need an account?"}{" "}
+              <button
+                className="text-button"
+                onClick={() => {
+                  setInviteMode(inviteMode === "register" ? "login" : "register");
+                  setError("");
+                  setPassword("");
+                }}
+                type="button"
+              >
+                {inviteMode === "register" ? "Sign in" : "Create account"}
+              </button>
+            </p>
+          )}
         </section>
         <p className="footer">Your account is protected with secure, private sign-in.</p>
       </main>
     );
   }
 
-  const monthStart = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), 1);
-  const calendarDays = Array.from({ length: 42 }, (_, index) =>
-    new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), 1 - monthStart.getDay() + index),
-  );
-  const selectedMonthLoans = dueLoans.filter((loan) => loan.dueDate.startsWith(monthKey(calendarMonth)));
   const upcomingLoans = dueLoans.filter((loan) => loan.dueDate >= today()).slice(0, 5);
   const monthlyReports = Array.from({ length: 6 }, (_, index) => {
     const date = new Date(new Date().getFullYear(), new Date().getMonth() - 5 + index, 1);
@@ -596,6 +679,11 @@ export default function App() {
   const totalBorrowed = loans.filter((loan) => loan.direction === "borrowed").reduce((sum, loan) => sum + loan.amount, 0);
   const totalReceived = loans.filter((loan) => loan.direction === "lent").reduce((sum, loan) => sum + loan.paid, 0);
   const totalRepaid = loans.filter((loan) => loan.direction === "borrowed").reduce((sum, loan) => sum + loan.paid, 0);
+  const reportPayments = paymentReport?.payments ?? [];
+  const filteredPayments = paymentUserFilter === "all"
+    ? reportPayments
+    : reportPayments.filter((payment) => String(payment.recordedBy?.id ?? "") === paymentUserFilter);
+  const filteredPaymentTotal = filteredPayments.reduce((total, payment) => total + payment.amount, 0);
 
   return (
     <div className="app-shell">
@@ -605,11 +693,12 @@ export default function App() {
         </a>
         <p className="nav-caption">WORKSPACE</p>
         <nav className="main-nav" aria-label="Main navigation">
-          {[["Overview", "overview"], ["Calendar", "calendar"], ["Reports", "report"]].map(([page, icon]) => (
+          {[["Overview", "overview"], ["Reports", "report"], ["Create account", "plus"]].map(([page, icon]) => (
             <button aria-current={activePage === page ? "page" : undefined} className={`nav-item ${activePage === page ? "active" : ""}`} key={page} onClick={() => setActivePage(page)} type="button">
               <Icon name={icon} />{page}{page === "Overview" && <span className="nav-count">{loans.length}</span>}
             </button>
           ))}
+          <button className="nav-item nav-signout" onClick={handleLogout} type="button"><Icon name="logout" />Sign out</button>
         </nav>
         <div className="sidebar-bottom">
           <div className="profile-card"><span className="profile-avatar">{user.email.slice(0, 1).toUpperCase()}</span><span className="profile-info"><strong>{user.email.split("@")[0]}</strong><small>{user.email}</small></span></div>
@@ -624,8 +713,6 @@ export default function App() {
             <select aria-label="Select workspace" className="workspace-picker" disabled={!workspaces.length} id="workspace-picker" onChange={selectWorkspace} value={selectedWorkspaceId ?? ""}>
               {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name} · {workspace.memberCount} member{workspace.memberCount === 1 ? "" : "s"}</option>)}
             </select>
-            <button className="header-action header-add-user" disabled={!selectedWorkspace || workspaceLoading} onClick={() => setShowAddUserDialog(true)} type="button"><Icon name="plus" /><span>Add user</span></button>
-            <button className="header-logout" onClick={handleLogout} type="button"><Icon name="logout" /><span>Sign out</span></button>
           </div>
         </header>
         <div className="content-wrap">
@@ -650,7 +737,7 @@ export default function App() {
                   <LoanTable loans={loans.slice(0, 6)} onPayment={setPaymentLoan} />
                 </section>
                 <section className="panel upcoming-panel">
-                  <div className="panel-heading"><div><h2>Upcoming due</h2><p>Keep an eye on what’s next</p></div><button aria-label="Open calendar" className="icon-button" onClick={() => setActivePage("Calendar")} type="button"><Icon name="arrow" /></button></div>
+                  <div className="panel-heading"><div><h2>Upcoming due</h2><p>Keep an eye on what’s next</p></div></div>
                   {upcomingLoans.length ? <div className="upcoming-list">{upcomingLoans.map((loan) => (
                     <article className="upcoming-item" key={loan.id}><span className={`due-date ${loan.dueDate < today() ? "past" : ""}`}><strong>{Number(loan.dueDate.slice(8, 10))}</strong><small>{new Intl.DateTimeFormat("en-US", { month: "short" }).format(new Date(`${loan.dueDate}T12:00:00`))}</small></span><span className="upcoming-info"><strong>{loan.counterparty}</strong><small>{loan.dueDate < today() ? "Past due" : loan.direction === "lent" ? "Expected repayment" : "Payment due"}</small></span><strong className="upcoming-amount">{money.format(loan.balance)}</strong></article>
                   ))}</div> : <div className="mini-empty"><span className="mini-empty-icon"><Icon name="check" /></span><strong>All clear</strong><span>No upcoming due dates.</span></div>}
@@ -659,23 +746,24 @@ export default function App() {
             </>
           )}
 
-          {activePage === "Calendar" && (
-            <>
-              <section className="page-heading"><div><p className="eyebrow">NEVER MISS A PAYMENT</p><h1>Loan calendar</h1><p className="page-subtitle">See when repayments are due at a glance.</p></div><button className="button add-loan-button" disabled={!selectedWorkspace || workspaceLoading} onClick={() => setShowLoanDialog(true)} type="button"><Icon name="plus" />Add a loan</button></section>
-              <section className="panel calendar-panel">
-                <div className="calendar-toolbar"><div><h2>{monthFormat.format(calendarMonth)}</h2><p>{selectedMonthLoans.length} loan{selectedMonthLoans.length === 1 ? "" : "s"} with a due date this month</p></div><div className="calendar-controls"><button aria-label="Previous month" className="icon-button" onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1, 1))} type="button"><Icon name="left" /></button><button className="today-button" onClick={() => setCalendarMonth(new Date(new Date().getFullYear(), new Date().getMonth(), 1))} type="button">Today</button><button aria-label="Next month" className="icon-button" onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 1))} type="button"><Icon name="right" /></button></div></div>
-                <div className="calendar-grid">
-                  {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => <div className="weekday" key={day}>{day}</div>)}
-                  {calendarDays.map((date) => {
-                    const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-                    const events = dueLoans.filter((loan) => loan.dueDate === key);
-                    return <div className={`calendar-day ${date.getMonth() !== calendarMonth.getMonth() ? "other-month" : ""} ${key === today() ? "is-today" : ""}`} key={key}><span className="day-number">{date.getDate()}</span>{events.slice(0, 2).map((loan) => <span className={`calendar-event ${loan.direction === "borrowed" ? "event-borrowed" : ""} ${key < today() ? "event-overdue" : ""}`} key={loan.id} title={`${loan.counterparty}: ${money.format(loan.balance)}`}><span>{loan.counterparty}</span><strong>{money.format(loan.balance)}</strong></span>)}{events.length > 2 && <span className="more-events">+{events.length - 2} more</span>}</div>;
-                  })}
-                </div>
-                <div className="calendar-legend"><span><i className="legend-lent" />Expected back</span><span><i className="legend-borrowed" />Payment due</span><span><i className="legend-overdue" />Past due</span></div>
-              </section>
-              <section className="panel month-due-panel"><div className="panel-heading"><div><h2>This month’s due dates</h2><p>Outstanding loans due in {monthFormat.format(calendarMonth)}</p></div></div><LoanTable loans={selectedMonthLoans} onPayment={setPaymentLoan} /></section>
-            </>
+          {activePage === "Create account" && (
+            <section className="account-create-wrap">
+              <div className="account-create-card">
+                <p className="eyebrow">NEW LOGIN</p>
+                <h1>Create an account</h1>
+                <p className="page-subtitle">Create a separate login with its own private ledger. You’ll be signed in to the new account when it’s ready; sign in again to return to this account.</p>
+                <form className="account-create-form" onSubmit={createAccount}>
+                  <label htmlFor="new-account-email">Email address</label>
+                  <input autoComplete="email" id="new-account-email" maxLength={254} onChange={(event) => setNewAccountEmail(event.target.value)} placeholder="person@example.com" required type="email" value={newAccountEmail} />
+                  <label htmlFor="new-account-password">Password</label>
+                  <input autoComplete="new-password" id="new-account-password" maxLength={128} minLength={8} onChange={(event) => setNewAccountPassword(event.target.value)} placeholder="At least 8 characters" required type="password" value={newAccountPassword} />
+                  <label htmlFor="new-account-confirm">Confirm password</label>
+                  <input autoComplete="new-password" id="new-account-confirm" maxLength={128} minLength={8} onChange={(event) => setNewAccountConfirm(event.target.value)} placeholder="Enter the password again" required type="password" value={newAccountConfirm} />
+                  {error && <p className="error" role="alert">{error}</p>}
+                  <button className="button account-create-submit" disabled={submitting} type="submit">{submitting ? "Creating account…" : "Create account"}</button>
+                </form>
+              </div>
+            </section>
           )}
 
           {activePage === "Reports" && (
@@ -702,6 +790,23 @@ export default function App() {
                   {[...monthlyReports].reverse().map((month) => <tr key={month.label}><td className="report-month">{month.label}</td><td className="positive-value">{money.format(month.lent)}</td><td className="negative-value">{money.format(month.borrowed)}</td><td>{money.format(month.repaid)}</td><td className={month.lent - month.borrowed >= 0 ? "positive-value" : "negative-value"}>{money.format(month.lent - month.borrowed)}</td></tr>)}
                 </tbody></table></div>
               </section>
+              <section className="panel payment-history-panel">
+                <div className="panel-heading payment-history-heading">
+                  <div><h2>Payment history</h2><p>All workspace repayments, with a history for each user</p></div>
+                  <label className="payment-user-filter" htmlFor="payment-user-filter">User
+                    <select id="payment-user-filter" onChange={(event) => setPaymentUserFilter(event.target.value)} value={paymentUserFilter}>
+                      <option value="all">All users</option>
+                      {(paymentReport?.members ?? []).map((member) => <option key={member.id} value={String(member.id)}>{member.email}</option>)}
+                    </select>
+                  </label>
+                </div>
+                <div className="payment-history-summary"><strong>{money.format(filteredPaymentTotal)}</strong><span>{filteredPayments.length} payment{filteredPayments.length === 1 ? "" : "s"}{paymentUserFilter === "all" ? " across all users" : " by this user"}</span></div>
+                {paymentReportLoading ? <p className="payment-history-empty">Loading payment history…</p> : filteredPayments.length ? (
+                  <div className="table-scroll"><table><thead><tr><th>DATE</th><th>LOAN</th><th>COUNTERPARTY</th><th>RECORDED BY</th><th>AMOUNT</th></tr></thead><tbody>
+                    {filteredPayments.map((payment) => <tr key={payment.id}><td>{dateLabel(payment.paymentDate)}</td><td><span className={`direction direction-${payment.direction}`}>{payment.direction === "lent" ? "Lent" : "Borrowed"}</span></td><td>{payment.counterparty}</td><td>{payment.recordedBy?.email ?? "Not attributed (older payment)"}</td><td className="balance-cell">{money.format(payment.amount)}</td></tr>)}
+                  </tbody></table></div>
+                ) : <p className="payment-history-empty">No payments found for this selection.</p>}
+              </section>
             </>
           )}
 
@@ -711,7 +816,6 @@ export default function App() {
       {showLoanDialog && <LoanDialog busy={submitting} onClose={() => setShowLoanDialog(false)} onSave={addLoan} />}
       {paymentLoan && <PaymentDialog busy={submitting} loan={paymentLoan} onClose={() => setPaymentLoan(null)} onSave={addPayment} />}
       {showWorkspaceDialog && <WorkspaceDialog busy={submitting} onClose={() => setShowWorkspaceDialog(false)} onSave={createWorkspace} />}
-      {showAddUserDialog && selectedWorkspace && <AddUserDialog busy={submitting} onClose={() => setShowAddUserDialog(false)} onSave={addWorkspaceMember} workspace={selectedWorkspace} />}
       {showRemoveWorkspaceDialog && selectedWorkspace && <RemoveWorkspaceDialog busy={submitting} onClose={() => setShowRemoveWorkspaceDialog(false)} onRemove={removeWorkspace} workspace={selectedWorkspace} />}
     </div>
   );

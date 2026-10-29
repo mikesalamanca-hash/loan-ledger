@@ -46,6 +46,14 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (workspace_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS workspace_invitations (
+    token_hash TEXT PRIMARY KEY,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    accepted_at INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
   CREATE TABLE IF NOT EXISTS loans (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -62,9 +70,15 @@ db.exec(`
     loan_id INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
     amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
     payment_date TEXT NOT NULL,
+    recorded_by_user_id INTEGER REFERENCES users(id),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 `);
+
+const paymentColumns = db.prepare("PRAGMA table_info(loan_payments)").all();
+if (!paymentColumns.some((column) => column.name === "recorded_by_user_id")) {
+  db.exec("ALTER TABLE loan_payments ADD COLUMN recorded_by_user_id INTEGER REFERENCES users(id)");
+}
 
 const loanColumns = db.prepare("PRAGMA table_info(loans)").all();
 if (!loanColumns.some((column) => column.name === "workspace_id")) {
@@ -203,6 +217,22 @@ function requireWorkspace(request, response, next) {
   return next();
 }
 
+function findInvitation(token) {
+  if (typeof token !== "string" || !/^[A-Za-z0-9_-]{40,60}$/.test(token)) {
+    return null;
+  }
+  return db
+    .prepare(
+      `SELECT workspace_invitations.token_hash, workspace_invitations.workspace_id,
+              workspace_invitations.email, workspace_invitations.expires_at,
+              workspace_invitations.accepted_at, workspaces.name AS workspace_name
+       FROM workspace_invitations
+       JOIN workspaces ON workspaces.id = workspace_invitations.workspace_id
+       WHERE workspace_invitations.token_hash = ?`,
+    )
+    .get(hashToken(token));
+}
+
 function isValidDate(value, optional = false) {
   if (optional && (value === undefined || value === null || value === "")) {
     return true;
@@ -238,8 +268,11 @@ function getWorkspaceLoans(workspaceId) {
   const payments = db
     .prepare(
       `SELECT loan_payments.id, loans.id AS loan_id, loan_payments.amount_cents,
-              loan_payments.payment_date
-       FROM loan_payments JOIN loans ON loans.id = loan_payments.loan_id
+              loan_payments.payment_date, users.id AS recorded_by_user_id,
+              users.email AS recorded_by_email
+       FROM loan_payments
+       JOIN loans ON loans.id = loan_payments.loan_id
+       LEFT JOIN users ON users.id = loan_payments.recorded_by_user_id
        WHERE loans.workspace_id = ?
        ORDER BY loan_payments.payment_date DESC, loan_payments.id DESC`,
     )
@@ -251,6 +284,9 @@ function getWorkspaceLoans(workspaceId) {
       id: payment.id,
       amount: payment.amount_cents / 100,
       paymentDate: payment.payment_date,
+      recordedBy: payment.recorded_by_user_id
+        ? { id: payment.recorded_by_user_id, email: payment.recorded_by_email }
+        : null,
     });
     paymentsByLoan.set(payment.loan_id, list);
   }
@@ -304,6 +340,81 @@ app.post("/api/auth/register", async (request, response) => {
   ).run(Number(workspace.lastInsertRowid), user.id);
   issueSession(response, user.id);
   return response.status(201).json({ user: publicUser(user) });
+});
+
+app.post("/api/auth/register-invitation", async (request, response) => {
+  const email = normalizeEmail(request.body?.email);
+  const password = request.body?.password;
+  const token = request.body?.token;
+  const invitation = findInvitation(token);
+
+  if (!invitation || invitation.accepted_at || invitation.expires_at <= Date.now()) {
+    return response.status(410).json({ error: "This invitation is invalid, expired, or already used." });
+  }
+  if (!validEmail(email) || email !== invitation.email) {
+    return response.status(400).json({ error: "Use the email address this invitation was sent to." });
+  }
+  if (typeof password !== "string" || password.length < 8 || password.length > 128) {
+    return response.status(400).json({ error: "Password must be between 8 and 128 characters." });
+  }
+  if (db.prepare("SELECT id FROM users WHERE email = ?").get(email)) {
+    return response.status(409).json({
+      error: "An account already exists for this email. Sign in with that account to accept the invitation.",
+    });
+  }
+
+  const salt = crypto.randomBytes(16).toString("hex");
+  const passwordDigest = await passwordHash(password, salt);
+  let user;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    const result = db
+      .prepare("INSERT INTO users (email, password_hash, password_salt) VALUES (?, ?, ?)")
+      .run(email, passwordDigest.toString("hex"), salt);
+    const userId = Number(result.lastInsertRowid);
+    const workspaceName = `${email.split("@")[0]}'s ledger`.slice(0, 60);
+    const personalWorkspace = db
+      .prepare("INSERT INTO workspaces (name, owner_id) VALUES (?, ?)")
+      .run(workspaceName, userId);
+    db.prepare(
+      "INSERT INTO workspace_memberships (workspace_id, user_id, role) VALUES (?, ?, 'owner')",
+    ).run(Number(personalWorkspace.lastInsertRowid), userId);
+
+    const currentInvitation = findInvitation(token);
+    if (
+      !currentInvitation ||
+      currentInvitation.accepted_at ||
+      currentInvitation.expires_at <= Date.now() ||
+      currentInvitation.email !== email ||
+      currentInvitation.workspace_id !== invitation.workspace_id
+    ) {
+      throw new Error("INVITATION_UNAVAILABLE");
+    }
+
+    db.prepare(
+      "INSERT INTO workspace_memberships (workspace_id, user_id, role) VALUES (?, ?, 'member')",
+    ).run(currentInvitation.workspace_id, userId);
+    db.prepare(
+      "UPDATE workspace_invitations SET accepted_at = ? WHERE token_hash = ? AND accepted_at IS NULL",
+    ).run(Date.now(), currentInvitation.token_hash);
+    user = db.prepare("SELECT id, email FROM users WHERE id = ?").get(userId);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    if (db.prepare("SELECT id FROM users WHERE email = ?").get(email)) {
+      return response.status(409).json({ error: "An account with that email already exists." });
+    }
+    if (error.message === "INVITATION_UNAVAILABLE") {
+      return response.status(410).json({ error: "This invitation is invalid, expired, or already used." });
+    }
+    throw error;
+  }
+
+  issueSession(response, user.id);
+  return response.status(201).json({
+    user: publicUser(user),
+    workspaceId: invitation.workspace_id,
+  });
 });
 
 app.post("/api/auth/login", async (request, response) => {
@@ -448,6 +559,85 @@ app.post("/api/workspaces/:id/members", requireSession, requireWorkspace, (reque
   });
 });
 
+app.get("/api/workspace-invitations/:token", (request, response) => {
+  const invitation = findInvitation(request.params.token);
+  if (!invitation || invitation.accepted_at || invitation.expires_at <= Date.now()) {
+    return response.status(410).json({ error: "This invitation is invalid, expired, or already used." });
+  }
+  return response.json({
+    invitation: {
+      email: invitation.email,
+      workspaceName: invitation.workspace_name,
+      expiresAt: invitation.expires_at,
+    },
+  });
+});
+
+app.post("/api/workspace-invitations/:token/accept", requireSession, (request, response) => {
+  const invitation = findInvitation(request.params.token);
+  if (!invitation || invitation.accepted_at || invitation.expires_at <= Date.now()) {
+    return response.status(410).json({ error: "This invitation is invalid, expired, or already used." });
+  }
+  if (request.user.email !== invitation.email) {
+    return response.status(403).json({
+      error: `Sign in with ${invitation.email} to accept this invitation.`,
+    });
+  }
+
+  const acceptInvitation = db.transaction(() => {
+    const currentInvitation = findInvitation(request.params.token);
+    if (
+      !currentInvitation ||
+      currentInvitation.accepted_at ||
+      currentInvitation.expires_at <= Date.now()
+    ) {
+      return false;
+    }
+    db.prepare(
+      `INSERT OR IGNORE INTO workspace_memberships (workspace_id, user_id, role)
+       VALUES (?, ?, 'member')`,
+    ).run(currentInvitation.workspace_id, request.user.id);
+    db.prepare(
+      "UPDATE workspace_invitations SET accepted_at = ? WHERE token_hash = ? AND accepted_at IS NULL",
+    ).run(Date.now(), currentInvitation.token_hash);
+    return true;
+  });
+
+  if (!acceptInvitation()) {
+    return response.status(410).json({ error: "This invitation is invalid, expired, or already used." });
+  }
+  return response.json({ workspaceId: invitation.workspace_id, workspaceName: invitation.workspace_name });
+});
+
+app.post("/api/workspaces/:id/invitations", requireSession, requireWorkspace, (request, response) => {
+  if (Number(request.params.id) !== request.workspace.id) {
+    return response.status(403).json({ error: "You do not have access to this workspace." });
+  }
+
+  const email = normalizeEmail(request.body?.email);
+  if (!validEmail(email)) {
+    return response.status(400).json({ error: "Enter a valid email address." });
+  }
+  if (email === request.user.email) {
+    return response.status(400).json({ error: "You are already a member of this workspace." });
+  }
+  if (db.prepare("SELECT id FROM users WHERE email = ?").get(email)) {
+    return response.status(409).json({ error: "An account already exists. Add this user directly instead." });
+  }
+
+  const token = crypto.randomBytes(32).toString("base64url");
+  const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  db.prepare(
+    `DELETE FROM workspace_invitations
+     WHERE workspace_id = ? AND email = ? AND accepted_at IS NULL`,
+  ).run(request.workspace.id, email);
+  db.prepare(
+    `INSERT INTO workspace_invitations (token_hash, workspace_id, email, expires_at)
+     VALUES (?, ?, ?, ?)`,
+  ).run(hashToken(token), request.workspace.id, email, expiresAt);
+  return response.status(201).json({ invitationUrl: `/?invite=${token}`, expiresAt });
+});
+
 app.delete("/api/workspaces/:id", requireSession, requireWorkspace, (request, response) => {
   if (Number(request.params.id) !== request.workspace.id) {
     return response.status(403).json({ error: "You do not have access to this workspace." });
@@ -486,6 +676,44 @@ app.delete("/api/workspaces/:id", requireSession, requireWorkspace, (request, re
 
 app.get("/api/loans", requireSession, requireWorkspace, (request, response) => {
   return response.json({ loans: getWorkspaceLoans(request.workspace.id) });
+});
+
+app.get("/api/reports/payments", requireSession, requireWorkspace, (request, response) => {
+  const members = db
+    .prepare(
+      `SELECT users.id, users.email
+       FROM workspace_memberships
+       JOIN users ON users.id = workspace_memberships.user_id
+       WHERE workspace_memberships.workspace_id = ?
+       ORDER BY users.email`,
+    )
+    .all(request.workspace.id);
+  const payments = db
+    .prepare(
+      `SELECT loan_payments.id, loans.id AS loan_id, loans.direction,
+              loans.counterparty, loan_payments.amount_cents,
+              loan_payments.payment_date, users.id AS recorded_by_user_id,
+              users.email AS recorded_by_email
+       FROM loan_payments
+       JOIN loans ON loans.id = loan_payments.loan_id
+       LEFT JOIN users ON users.id = loan_payments.recorded_by_user_id
+       WHERE loans.workspace_id = ?
+       ORDER BY loan_payments.payment_date DESC, loan_payments.id DESC`,
+    )
+    .all(request.workspace.id)
+    .map((payment) => ({
+      id: payment.id,
+      loanId: payment.loan_id,
+      direction: payment.direction,
+      counterparty: payment.counterparty,
+      amount: payment.amount_cents / 100,
+      paymentDate: payment.payment_date,
+      recordedBy: payment.recorded_by_user_id
+        ? { id: payment.recorded_by_user_id, email: payment.recorded_by_email }
+        : null,
+    }));
+
+  return response.json({ members, payments });
 });
 
 app.post("/api/loans", requireSession, requireWorkspace, (request, response) => {
@@ -566,8 +794,9 @@ app.post("/api/loans/:id/payments", requireSession, requireWorkspace, (request, 
   }
 
   db.prepare(
-    "INSERT INTO loan_payments (loan_id, amount_cents, payment_date) VALUES (?, ?, ?)",
-  ).run(loanId, amountCents, paymentDate);
+    `INSERT INTO loan_payments (loan_id, amount_cents, payment_date, recorded_by_user_id)
+     VALUES (?, ?, ?, ?)`,
+  ).run(loanId, amountCents, paymentDate, request.user.id);
   const updatedLoan = getWorkspaceLoans(request.workspace.id).find((item) => item.id === loanId);
   return response.status(201).json({ loan: updatedLoan });
 });
